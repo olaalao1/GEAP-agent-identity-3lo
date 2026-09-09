@@ -30,13 +30,13 @@ from vertexai import agent_engines
 # ==============================================================================
 # Configuration & Resource Identifiers
 # ==============================================================================
-PROJECT_ID = "gemini-cyber"
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "gemini-cyber")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 SPOTIFY_3LO_AUTH_PROVIDER_ID = os.environ.get(
     "SPOTIFY_3LO_AUTH_PROVIDER_ID", "spotify-3lo-auth"
 )
 
-# 1. Full GCP Auth Manager Connector Resource String
+# 1. GCP Auth Manager Connector Resource String
 SPOTIFY_3LO_AUTH_PROVIDER = (
     f"projects/{PROJECT_ID}/locations/{LOCATION}/connectors/"
     f"{SPOTIFY_3LO_AUTH_PROVIDER_ID}"
@@ -60,15 +60,21 @@ def extract_validation_state(input_str: str) -> str:
     if "user_id_validation_state=" in s:
         match = re.search(r"user_id_validation_state=([A-Za-z0-9_\-=]+)", s)
         if match:
-            return match.group(1)
-    tokens = re.findall(r"[A-Za-z0-9_\-=]{40,}", s)
-    if tokens:
-        return tokens[0]
+            s = match.group(1)
+    else:
+        tokens = re.findall(r"[A-Za-z0-9_\-=]{40,}", s)
+        if tokens:
+            s = tokens[0]
+
+    # Ensure required base64 padding
+    missing_padding = len(s) % 4
+    if missing_padding:
+        s += "=" * (4 - missing_padding)
     return s
 
 
 # ==============================================================================
-# 3. Spotify Authenticated Tool Function (Pure Conversational OAuth Flow)
+# 3. Spotify Authenticated Tool Function (Conversational OAuth Flow)
 # ==============================================================================
 async def spotify_get_playlists(
     tool_context: ToolContext,
@@ -83,90 +89,109 @@ async def spotify_get_playlists(
     user_id = tool_context.user_id or "default_user_id"
     client = iam_creds.IAMConnectorCredentialsServiceClient(transport="rest")
 
-    # Step A: Query Google Cloud Auth Manager for existing user credentials
-    req = iam_creds.RetrieveCredentialsRequest(
-        connector=SPOTIFY_3LO_AUTH_PROVIDER,
-        user_id=user_id,
-        scopes=["playlist-read-private"],
-        continue_uri=CONTINUE_URI,
-    )
-    operation = client.retrieve_credentials(req).operation
+    val_state = extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
+    is_code_provided = bool(val_state and len(val_state) >= 20)
 
-    token = None
-    if operation.done and operation.response:
-        resp = iam_creds.RetrieveCredentialsResponse.deserialize(
-            operation.response.value
-        )
-        if resp.token:
-            token = resp.token
+    # Step B: If the user provided an authorization code -> Finalize credentials!
+    if is_code_provided:
+        # Retrieve consent_nonce from persistent session state first, then in-memory fallback
+        consent_nonce = None
+        try:
+            consent_nonce = tool_context.state.get("consent_nonce")
+            saved_user_id = tool_context.state.get("user_id")
+            if saved_user_id:
+                user_id = saved_user_id
+        except Exception as e:
+            print(f"Warning reading tool_context.state: {e}", flush=True)
 
-    # Step B: If not yet authenticated, check if the user provided an authorization code
-    if not token:
-        val_state = extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
-        is_code_provided = bool(val_state and len(val_state) >= 20)
+        if not consent_nonce:
+            consent_nonce = _PENDING_NONCES.get(user_id) or _PENDING_NONCES.get("latest")
 
-        if is_code_provided:
-            # User supplied the authorization code from the landing page -> Finalize credentials!
-            consent_nonce = _PENDING_NONCES.get(user_id)
-            if not consent_nonce and operation.metadata:
-                meta = iam_creds.RetrieveCredentialsMetadata.deserialize(
-                    operation.metadata.value
-                )
-                if meta.uri_consent_required and meta.uri_consent_required.consent_nonce:
-                    consent_nonce = meta.uri_consent_required.consent_nonce
+        print(f"DEBUG FINALIZE: user_id={user_id}, consent_nonce={consent_nonce}", flush=True)
 
-            if not consent_nonce:
-                return (
-                    "Error: Could not locate an active consent nonce for this session. "
-                    "Please ask to view your playlists again to generate a new authorization link."
-                )
-
-            finalize_url = (
-                f"https://iamconnectorcredentials.googleapis.com/v1alpha/"
-                f"{SPOTIFY_3LO_AUTH_PROVIDER}/credentials:finalize"
+        if not consent_nonce:
+            return (
+                "❌ **Session Nonce Not Found**\n\n"
+                "Could not locate an active consent nonce for this session. "
+                "Please make sure you paste the code into the same chat session where you "
+                "requested your playlists, or ask for your playlists again to generate a fresh link."
             )
-            payload = {
-                "userId": user_id,
-                "userIdValidationState": val_state,
-                "consentNonce": consent_nonce,
-            }
 
-            print(f"DEBUG FINALIZING: url={finalize_url}", flush=True)
-            print(f"DEBUG FINALIZING: userId={user_id}, consentNonce={consent_nonce}, val_state_len={len(val_state)}", flush=True)
+        payload = {
+            "userId": user_id,
+            "userIdValidationState": val_state,
+            "consentNonce": consent_nonce,
+        }
 
+        # Try both PROJECT_ID and 'gemini-cyber' in case of container env mismatch
+        endpoints = [
+            f"https://iamconnectorcredentials.googleapis.com/v1alpha/{SPOTIFY_3LO_AUTH_PROVIDER}/credentials:finalize",
+            f"https://iamconnectorcredentials.googleapis.com/v1alpha/projects/gemini-cyber/locations/{LOCATION}/connectors/{SPOTIFY_3LO_AUTH_PROVIDER_ID}/credentials:finalize",
+        ]
+
+        fin_resp = None
+        for fin_url in endpoints:
+            print(f"DEBUG CALLING FINALIZE: {fin_url}", flush=True)
             async with httpx.AsyncClient() as http_client:
                 fin_resp = await http_client.post(
-                    finalize_url,
+                    fin_url,
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
-
             print(f"DEBUG FINALIZE STATUS: {fin_resp.status_code}", flush=True)
             print(f"DEBUG FINALIZE BODY: {fin_resp.text}", flush=True)
+            if fin_resp.status_code == 200:
+                break
 
-            if fin_resp.status_code != 200:
-                return (
-                    f"❌ **Spotify Credential Finalization Failed (HTTP {fin_resp.status_code})**\n\n"
-                    f"**Details from Google Cloud Auth Manager:**\n"
-                    f"```json\n{fin_resp.text}\n```\n\n"
-                    f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`\n\n"
-                    "Please check the error details above or ask for your playlists again to receive a fresh authorization link."
-                )
+        if not fin_resp or fin_resp.status_code != 200:
+            return (
+                f"❌ **Spotify Credential Finalization Failed (HTTP {fin_resp.status_code if fin_resp else 'Unknown'})**\n\n"
+                f"**Details from Google Cloud Auth Manager:**\n"
+                f"```json\n{fin_resp.text if fin_resp else 'No response'}\n```\n\n"
+                f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`\n\n"
+                "Please check the error details above or ask for your playlists again to receive a fresh authorization link."
+            )
 
-            # Step C: Credentials successfully finalized! Retrieve the new access token
-            op_final = client.retrieve_credentials(req).operation
-            if op_final.done and op_final.response:
-                resp = iam_creds.RetrieveCredentialsResponse.deserialize(
-                    op_final.response.value
-                )
+        # Step C: Credentials finalized! Retrieve the new access token
+        req = iam_creds.RetrieveCredentialsRequest(
+            connector=SPOTIFY_3LO_AUTH_PROVIDER,
+            user_id=user_id,
+            scopes=["playlist-read-private"],
+            continue_uri=CONTINUE_URI,
+        )
+        op_final = client.retrieve_credentials(req).operation
+        token = None
+        if op_final.done and op_final.response:
+            resp = iam_creds.RetrieveCredentialsResponse.deserialize(
+                op_final.response.value
+            )
+            token = resp.token
+
+        if not token:
+            return (
+                "Authorization was finalized, but the access token could not be retrieved. "
+                "Please try asking for your playlists again."
+            )
+
+    else:
+        # Step A: Query Google Cloud Auth Manager for existing user credentials
+        req = iam_creds.RetrieveCredentialsRequest(
+            connector=SPOTIFY_3LO_AUTH_PROVIDER,
+            user_id=user_id,
+            scopes=["playlist-read-private"],
+            continue_uri=CONTINUE_URI,
+        )
+        operation = client.retrieve_credentials(req).operation
+
+        token = None
+        if operation.done and operation.response:
+            resp = iam_creds.RetrieveCredentialsResponse.deserialize(
+                operation.response.value
+            )
+            if resp.token:
                 token = resp.token
-            else:
-                return (
-                    "Authorization was finalized, but access token could not be retrieved. "
-                    "Please try asking for your playlists again."
-                )
 
-        else:
+        if not token:
             # First turn: Return the direct Spotify authorization link with instructions
             if operation.metadata:
                 meta = iam_creds.RetrieveCredentialsMetadata.deserialize(
@@ -174,7 +199,17 @@ async def spotify_get_playlists(
                 )
                 if meta.uri_consent_required and meta.uri_consent_required.authorization_uri:
                     auth_uri = meta.uri_consent_required.authorization_uri
-                    _PENDING_NONCES[user_id] = meta.uri_consent_required.consent_nonce
+                    consent_nonce = meta.uri_consent_required.consent_nonce
+
+                    _PENDING_NONCES[user_id] = consent_nonce
+                    _PENDING_NONCES["latest"] = consent_nonce
+
+                    try:
+                        tool_context.state["user_id"] = user_id
+                        tool_context.state["consent_nonce"] = consent_nonce
+                        print(f"DEBUG SAVED STATE: user_id={user_id}, consent_nonce={consent_nonce}", flush=True)
+                    except Exception as e:
+                        print(f"Warning saving tool_context.state: {e}", flush=True)
 
                     return (
                         "🔒 **Spotify Authorization Required**\n\n"
