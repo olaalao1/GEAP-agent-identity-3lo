@@ -6,6 +6,21 @@ In this sample, the agent queries the **Spotify Web API** on behalf of the user 
 
 ---
 
+## Supported Interaction Modes
+
+This POC supports two primary user interaction modes:
+
+1. **Option 2: Direct Vertex AI Agent Engine Playground (Zero-Compute Conversational Flow)**  
+   * Ideal for Google Cloud Console Playground, Slack, Teams, or any headless chat interface without running custom client servers.
+   * Uses a lightweight static landing page hosted on Google Cloud Storage (`oauth_callback.html`) as the `continue_uri`.
+   * The agent provides a direct authorization link in chat. After approval, the landing page provides a single-click "Copy Authorization Code" button. The user pastes the code into the chat, and the agent finalizes credentials and displays the private playlists.
+
+2. **Option 1: Custom Web App with Automated Popups (`client/`)**  
+   * Ideal for enterprise web portals embedding the agent where an automatic popup/iframe authorization lifecycle is preferred.
+   * Uses a FastAPI backend that handles the OAuth popup redirect and credential finalization automatically.
+
+---
+
 ## Architecture & OAuth 3LO Flow
 
 The 3-legged OAuth flow delegates access to external user resources while ensuring zero token storage liability for the application. The tokens are encrypted and managed directly by Google Cloud Agent Identity Auth Manager.
@@ -14,16 +29,32 @@ The 3-legged OAuth flow delegates access to external user resources while ensuri
 
 ![OAuth 3LO Flow](./images/oauth_3lo_flow.png)
 
-### Hop-by-Hop Flow Explanation
+### Conversational Flow (Option 2 — Playground)
 
-1. **User Request**: The user asks the agent a question requiring private data (e.g., *"Get my private playlists"*).
-2. **Missing Credential Interception**: The ADK agent attempts to call `spotify_get_playlists` and queries the GCP Auth Manager. Because no valid token exists for this user, the agent pauses and yields an `adk_request_credential` tool call containing the third-party authorization URL and a `consent_nonce`.
-3. **Consent Prompt**: The client application (web UI / portal) detects `adk_request_credential` and opens the Spotify authorization URL in a browser popup.
-4. **User Grants Consent**: The user logs in to Spotify and clicks **Agree**.
-5. **Spotify Callback to Google**: Spotify redirects the user's browser to the Google Cloud Auth Manager connector callback URL (`https://iamconnectorcredentials.googleapis.com/.../connectors/spotify-3lo-auth/oauthcallback`). Google Auth Manager securely captures the authorization code and exchanges it for user access and refresh tokens.
-6. **Redirect to `continue_uri`**: Google Auth Manager redirects the browser to the application's `continue_uri` (e.g., `http://localhost:8080/commit`) with a `user_id_validation_state` token.
-7. **Credentials Finalization**: The client's `/commit` endpoint calls Google's `FinalizeCredentials` API to verify the session and close the popup.
-8. **Conversation Resumes**: The client sends a `FunctionResponse` to the agent. The agent seamlessly re-executes the tool call with the newly stored token and returns the private playlist data to the user.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as End User (Playground)
+    participant Agent as Vertex AI Agent Engine
+    participant AuthMgr as GCP Auth Manager
+    participant Spotify as Spotify Accounts API
+    participant GCS as GCS Landing Page
+
+    User->>Agent: "Get my private playlists"
+    Agent->>AuthMgr: RetrieveCredentialsRequest(continue_uri=GCS)
+    AuthMgr-->>Agent: URI_CONSENT_REQUIRED (Spotify Auth URL + consent_nonce)
+    Agent-->>User: Returns clickable Spotify authorization URL
+    User->>Spotify: Clicks link & clicks "Agree"
+    Spotify->>AuthMgr: Redirects to oauthcallback (code + state)
+    AuthMgr->>GCS: 302 Redirect to oauth_callback.html?user_id_validation_state=...
+    GCS-->>User: Displays "Spotify Connected" + "Copy Authorization Code" button
+    User->>Agent: Pastes authorization code or URL into chat
+    Agent->>AuthMgr: FinalizeCredentials(userId, consentNonce, validationState)
+    AuthMgr-->>Agent: 200 OK (Credentials Stored in Vault)
+    Agent->>AuthMgr: RetrieveCredentialsRequest (Returns OAuth Access Token)
+    Agent->>Spotify: GET https://api.spotify.com/v1/me/playlists
+    Agent-->>User: Formatted private playlists!
+```
 
 ---
 
@@ -32,13 +63,14 @@ The 3-legged OAuth flow delegates access to external user resources while ensuri
 ```
 .
 ├── README.md                  # Detailed architecture and setup guide
-├── agent.py                   # ADK agent with Spotify 3LO authenticated tool
+├── agent.py                   # ADK agent with conversational 3LO tool
+├── oauth_callback.html        # Static public landing page hosted on Cloud Storage
 ├── deploy.py                  # Deployment script to Vertex AI Agent Engine with AGENT_IDENTITY
 ├── setup_auth_manager.sh      # Shell script to provision the GCP Auth Manager connector
 ├── .env.example               # Template for environment variables
 ├── images/
 │   └── oauth_3lo_flow.png     # Architectural flow diagram
-└── client/                    # 3LO-compatible FastAPI web client (interactive playground)
+└── client/                    # Optional: FastAPI web client with popup handling
     ├── main.py                # FastAPI backend handling chat stream and /commit callback
     ├── requirements.txt       # Client dependencies
     └── static/                # UI frontend (HTML/CSS/JS)
@@ -54,7 +86,7 @@ The 3-legged OAuth flow delegates access to external user resources while ensuri
    * Enabled APIs:
      * `aiplatform.googleapis.com` (Vertex AI Agent Engine)
      * `iamconnectors.googleapis.com` (IAM Connectors / Auth Manager)
-   * Cloud Storage bucket for staging artifacts (e.g., `gs://agent-staging-buck`).
+   * Cloud Storage bucket for staging artifacts and the callback landing page (e.g., `gs://agent-staging-buck`).
 
 2. **Spotify Developer Account**:
    * An active **Spotify Premium subscription** is required by Spotify policy to access the Web API in Development Mode.
@@ -112,7 +144,28 @@ gcloud alpha agent-identity connectors create $SPOTIFY_3LO_AUTH_PROVIDER_ID \
 
 ---
 
-### Step 3: Deploy to Gemini Enterprise Agent Platform
+### Step 3: Upload the Static Callback Landing Page
+
+Upload `oauth_callback.html` to your public Cloud Storage staging bucket:
+
+```bash
+# Upload HTML landing page
+gcloud storage cp oauth_callback.html gs://agent-staging-buck/oauth_callback.html
+
+# Grant public read access
+gcloud storage buckets add-iam-policy-binding gs://agent-staging-buck \
+    --member="allUsers" \
+    --role="roles/storage.objectViewer"
+```
+
+Verify it is reachable:
+```bash
+curl -I https://storage.googleapis.com/agent-staging-buck/oauth_callback.html
+```
+
+---
+
+### Step 4: Deploy to Gemini Enterprise Agent Platform
 
 Run `deploy.py` to package and deploy the agent to Vertex AI Agent Engine with **Agent Identity**:
 
@@ -127,39 +180,29 @@ The script automatically:
 
 ---
 
-### Step 4: Run the Interactive 3LO Web Client
+### Step 5: Test in Vertex AI Agent Engine Playground
 
-Standard playgrounds (like generic console test panels) do not intercept the `adk_request_credential` event or host the `/commit` endpoint. Use the included 3LO FastAPI client:
-
-1. Navigate to the client directory and install dependencies:
-   ```bash
-   cd client
-   pip install -r requirements.txt
-   ```
-
-2. Start the client:
-   ```bash
-   uvicorn main:app --port 8080 --reload
-   ```
-
-3. Open `http://localhost:8080` in your browser. *(Note: Must use `localhost`, not `127.0.0.1`)*.
-4. In the settings sidebar:
-   * Set **Project ID**: `gemini-cyber`
-   * Set **Location**: `us-central1`
-   * Click **Load Remote Agents** and select `spotify-3lo-agent`.
-   * Click **Save & Apply Settings**.
-5. In the chat window, send:
+1. Open the [Vertex AI Agent Engine Console](https://console.cloud.google.com/vertex-ai/reasoning-engines?project=gemini-cyber).
+2. Select your deployed agent: `spotify-3lo-agent`.
+3. In the Playground chat, type:
    > *"Get my private playlists"*
-6. A popup window will prompt you to authorize with Spotify. Once approved, the popup closes, credentials are finalized with Auth Manager, and the agent outputs your private playlists.
+4. The agent will reply with:
+   > 🔒 **Spotify Authorization Required**  
+   > 👉 [**Click here to Authorize Spotify Access**](https://accounts.spotify.com/authorize...)
+5. Click the link and click **Agree** on Spotify.
+6. You will be redirected to the Cloud Storage landing page showing **Spotify Connected** and your authorization code.
+7. Click **📋 Copy Authorization Code** (or copy the URL).
+8. Return to the Playground chat and paste the code.
+9. The agent finalizes your credentials and outputs your private playlists!
 
 ---
 
 ## Production Enterprise Considerations
 
 In an enterprise environment:
-1. **Frontend / BFF**: The logic in `client/main.py` is embedded into the customer's existing Backend-for-Frontend (BFF) service (Cloud Run, GKE, API Gateway).
-2. **Zero Token Storage Liability**: The customer's backend never touches, encrypts, or stores third-party OAuth refresh tokens. Google Auth Manager manages the entire token lifecycle.
-3. **One-Time Consent UX**: Once a user completes authorization, their tokens persist in Google's managed vault under their enterprise `user_id`, meaning subsequent sessions do not require re-authentication until revoked.
+1. **Zero Token Storage Liability**: The customer's backend or agent never touches, encrypts, or stores third-party OAuth refresh tokens. Google Cloud Auth Manager manages the entire token lifecycle in an enterprise vault.
+2. **One-Time Consent UX**: Once a user completes authorization, their tokens persist in Google's managed vault under their enterprise `user_id`. Subsequent queries do not require re-authentication until tokens are revoked.
+3. **No Compute Infrastructure Required for Auth Callback**: By using a static HTML page in Cloud Storage (or an existing static portal asset) as the `continue_uri`, the authorization flow does not require maintaining dedicated redirect servers or microservices.
 
 ---
 

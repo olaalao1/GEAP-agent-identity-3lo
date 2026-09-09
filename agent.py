@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from google.adk.agents import Agent
 from google.adk.apps import App
@@ -40,27 +42,48 @@ SPOTIFY_3LO_AUTH_PROVIDER = (
     f"{SPOTIFY_3LO_AUTH_PROVIDER_ID}"
 )
 
-# 2. Frontend Return URL (continue_uri)
+# 2. Public Landing Page Return URL (continue_uri in Cloud Storage)
 CONTINUE_URI = os.environ.get(
-    "CONTINUE_URI", "http://localhost:8080/commit"
+    "CONTINUE_URI",
+    "https://storage.googleapis.com/agent-staging-buck/oauth_callback.html",
 )
 
 MODEL = "gemini-2.5-flash"
 
+# In-memory store for pending consent nonces per user
+_PENDING_NONCES: dict[str, str] = {}
+
+
+def extract_validation_state(input_str: str) -> str:
+    """Extracts the user_id_validation_state from a raw token or full callback URL."""
+    s = input_str.strip()
+    if "user_id_validation_state=" in s:
+        match = re.search(r"user_id_validation_state=([A-Za-z0-9_\-]+)", s)
+        if match:
+            return match.group(1)
+    tokens = re.findall(r"[A-Za-z0-9_\-]{40,}", s)
+    if tokens:
+        return tokens[0]
+    return s
+
 
 # ==============================================================================
-# 3. Spotify Authenticated Tool Function (with Conversational OAuth Link)
+# 3. Spotify Authenticated Tool Function (Pure Conversational OAuth Flow)
 # ==============================================================================
-async def spotify_get_playlists(tool_context: ToolContext) -> str | list[dict[str, Any]]:
+async def spotify_get_playlists(
+    tool_context: ToolContext,
+    auth_code_or_url: str = "",
+) -> str | list[dict[str, Any]]:
     """Fetches the current user's private playlists from Spotify.
 
-    If the user has not yet authorized Spotify access, this tool automatically
-    returns a clickable Spotify authorization link directly in the chat.
+    Args:
+        auth_code_or_url: Optional authorization code or callback URL obtained from
+            the Spotify authorization confirmation page. Leave empty on first call.
     """
     user_id = tool_context.user_id or "default_user_id"
     client = iam_creds.IAMConnectorCredentialsServiceClient(transport="rest")
 
-    # Step A: Query Google Cloud Auth Manager for user credentials (SINGLE CALL ONLY)
+    # Step A: Query Google Cloud Auth Manager for existing user credentials
     req = iam_creds.RetrieveCredentialsRequest(
         connector=SPOTIFY_3LO_AUTH_PROVIDER,
         user_id=user_id,
@@ -71,39 +94,93 @@ async def spotify_get_playlists(tool_context: ToolContext) -> str | list[dict[st
 
     token = None
     if operation.done and operation.response:
-        resp = iam_creds.RetrieveCredentialsResponse.deserialize(operation.response.value)
+        resp = iam_creds.RetrieveCredentialsResponse.deserialize(
+            operation.response.value
+        )
         if resp.token:
             token = resp.token
 
-    # Step B: If token is not yet ready, generate the authorization link for the user
+    # Step B: If not yet authenticated, check if the user provided an authorization code
     if not token:
-        if operation.metadata:
-            meta = iam_creds.RetrieveCredentialsMetadata.deserialize(operation.metadata.value)
-            if meta.uri_consent_required and meta.uri_consent_required.authorization_uri:
-                auth_uri = meta.uri_consent_required.authorization_uri
-                consent_nonce = meta.uri_consent_required.consent_nonce
+        val_state = extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
+        is_code_provided = bool(val_state and len(val_state) >= 20)
 
-                # Base host from CONTINUE_URI (e.g., http://localhost:8080)
-                base_host = CONTINUE_URI.rsplit("/", 1)[0]
-                import urllib.parse
-                start_auth_url = (
-                    f"{base_host}/start-auth?"
-                    f"user_id={urllib.parse.quote(user_id)}&"
-                    f"consent_nonce={urllib.parse.quote(consent_nonce)}&"
-                    f"auth_uri={urllib.parse.quote(auth_uri)}"
+        if is_code_provided:
+            # User supplied the authorization code from the landing page -> Finalize credentials!
+            consent_nonce = _PENDING_NONCES.get(user_id)
+            if not consent_nonce and operation.metadata:
+                meta = iam_creds.RetrieveCredentialsMetadata.deserialize(
+                    operation.metadata.value
                 )
+                if meta.uri_consent_required and meta.uri_consent_required.consent_nonce:
+                    consent_nonce = meta.uri_consent_required.consent_nonce
 
+            if not consent_nonce:
                 return (
-                    "🔒 **Spotify Authorization Required**\n\n"
-                    "To access your private playlists, please authorize access to your Spotify account:\n\n"
-                    f"👉 [**Click here to Authorize Spotify Access**]({start_auth_url})\n\n"
-                    "*(Once you click the link and complete authorization in your browser, "
-                    "return to this chat and reply with **'Done'** or **'Fetch my playlists'**)*"
+                    "Error: Could not locate an active consent nonce for this session. "
+                    "Please ask to view your playlists again to generate a new authorization link."
                 )
 
-        return "Error: Unable to retrieve credentials or generate authorization URL from Auth Manager."
+            finalize_url = (
+                f"https://iamconnectorcredentials.googleapis.com/v1alpha/"
+                f"{SPOTIFY_3LO_AUTH_PROVIDER}/credentials:finalize"
+            )
+            payload = {
+                "userId": user_id,
+                "userIdValidationState": val_state,
+                "consentNonce": consent_nonce,
+            }
 
-    # Step C: When token is available, query Spotify Web API
+            async with httpx.AsyncClient() as http_client:
+                fin_resp = await http_client.post(
+                    finalize_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+
+            if fin_resp.status_code != 200:
+                return (
+                    f"Authorization finalization failed (HTTP {fin_resp.status_code}): {fin_resp.text}\n\n"
+                    "Please ask for your playlists again to receive a fresh authorization link."
+                )
+
+            # Step C: Credentials successfully finalized! Retrieve the new access token
+            op_final = client.retrieve_credentials(req).operation
+            if op_final.done and op_final.response:
+                resp = iam_creds.RetrieveCredentialsResponse.deserialize(
+                    op_final.response.value
+                )
+                token = resp.token
+            else:
+                return (
+                    "Authorization was finalized, but access token could not be retrieved. "
+                    "Please try asking for your playlists again."
+                )
+
+        else:
+            # First turn: Return the direct Spotify authorization link with instructions
+            if operation.metadata:
+                meta = iam_creds.RetrieveCredentialsMetadata.deserialize(
+                    operation.metadata.value
+                )
+                if meta.uri_consent_required and meta.uri_consent_required.authorization_uri:
+                    auth_uri = meta.uri_consent_required.authorization_uri
+                    _PENDING_NONCES[user_id] = meta.uri_consent_required.consent_nonce
+
+                    return (
+                        "🔒 **Spotify Authorization Required**\n\n"
+                        "To access your private playlists, please authorize access to your Spotify account:\n\n"
+                        f"👉 [**Click here to Authorize Spotify Access**]({auth_uri})\n\n"
+                        "**Instructions:**\n"
+                        "1. Click the link above to log in and approve Spotify access.\n"
+                        "2. You will be redirected to an authorization confirmation page.\n"
+                        "3. Click **\"📋 Copy Authorization Code\"** on that page.\n"
+                        "4. **Paste the code back into this chat**, and I will fetch your playlists!"
+                    )
+
+            return "Error: Unable to retrieve credentials or generate authorization URL from Auth Manager."
+
+    # Step D: Token is available -> Query Spotify Web API for private playlists
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient() as http_client:
         response = await http_client.get(
@@ -141,10 +218,16 @@ root_agent = Agent(
     name="spotify_3lo_agent",
     model=MODEL,
     instruction=(
-        "You are a helpful Spotify assistant. When the user asks for their playlists, "
-        "always use the spotify_get_playlists tool. If the tool returns an authorization "
-        "link, display it clearly as a clickable markdown link without altering the URL and "
-        "prompt the user to complete authorization. Once authorized, format the playlist details cleanly."
+        "You are a helpful Spotify assistant with access to the user's Spotify account.\n\n"
+        "When the user asks for their playlists:\n"
+        "1. Always call the spotify_get_playlists tool.\n"
+        "2. If the tool returns an authorization link, present the link clearly to the user "
+        "as a markdown link without altering the URL, and provide the instructions to copy the "
+        "authorization code from the confirmation page and paste it back into the chat.\n"
+        "3. When the user provides an authorization code, token, or callback URL in their response, "
+        "immediately call spotify_get_playlists with the auth_code_or_url parameter containing "
+        "the user's provided code or URL.\n"
+        "4. Once the playlists are retrieved, present the playlist names and track counts clearly."
     ),
     tools=[spotify_tool],
 )

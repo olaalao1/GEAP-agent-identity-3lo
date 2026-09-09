@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spotify Authorization Approved</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: #f8fafc;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      color: #1e293b;
+    }
+    .card {
+      background: white;
+      max-width: 560px;
+      width: 100%;
+      padding: 40px;
+      border-radius: 16px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+      border: 1px solid #e2e8f0;
+      text-align: center;
+    }
+    .icon {
+      font-size: 54px;
+      margin-bottom: 16px;
+    }
+    .badge {
+      display: inline-block;
+      background: #e8f5e9;
+      color: #1DB954;
+      font-weight: 600;
+      font-size: 13px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      margin-bottom: 16px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 26px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    p {
+      margin: 0 0 24px;
+      color: #64748b;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+    .code-box {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 20px;
+      word-break: break-all;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      color: #334155;
+      max-height: 120px;
+      overflow-y: auto;
+      text-align: left;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      background: #1DB954;
+      color: white;
+      font-weight: 600;
+      font-size: 16px;
+      padding: 14px 20px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s ease-in-out;
+      box-shadow: 0 4px 6px -1px rgba(29, 185, 84, 0.2);
+    }
+    .btn:hover {
+      background: #1aa34a;
+    }
+    .copied-toast {
+      display: none;
+      margin-top: 14px;
+      font-size: 14px;
+      color: #16a34a;
+      font-weight: 600;
+    }
+    .instruction {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid #e2e8f0;
+      font-size: 14px;
+      color: #475569;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🎵</div>
+    <div class="badge">Spotify Connected</div>
+    <h1>Authorization Successful!</h1>
+    <p>Your Spotify account has been authorized. Copy the authorization code below and paste it into your Vertex AI Playground chat.</p>
+
+    <div class="code-box" id="tokenBox">Extracting authorization token...</div>
+
+    <button class="btn" id="copyBtn" onclick="copyToken()">📋 Copy Authorization Code</button>
+    <div class="copied-toast" id="toast">✅ Copied to clipboard! Now return to Playground and paste.</div>
+
+    <div class="instruction">
+      👉 Return to the <strong>Vertex AI Agent Engine Playground</strong> and paste this code to view your private playlists.
+    </div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const state = params.get('user_id_validation_state') || window.location.href;
+    const box = document.getElementById('tokenBox');
+    box.textContent = state;
+
+    function copyToken() {
+      navigator.clipboard.writeText(state).then(() => {
+        const toast = document.getElementById('toast');
+        const btn = document.getElementById('copyBtn');
+        toast.style.display = 'block';
+        btn.textContent = '✅ Copied!';
+        btn.style.background = '#15803d';
+      }).catch(err => {
+        const temp = document.createElement('textarea');
+        temp.value = state;
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand('copy');
+        document.body.removeChild(temp);
+        document.getElementById('toast').style.display = 'block';
+      });
+    }
+  </script>
+</body>
+</html>

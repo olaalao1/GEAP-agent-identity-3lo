@@ -322,6 +322,11 @@ _PENDING_CONSENTS: dict[str, str] = {}
 _LATEST_PENDING: dict[str, str] = {}
 
 
+@app.get("/debug_pending")
+async def debug_pending():
+  return {"pending": _PENDING_CONSENTS, "latest": _LATEST_PENDING}
+
+
 @app.get("/start-auth")
 async def start_auth(user_id: str, consent_nonce: str, auth_uri: str):
   """Bridge endpoint for Playground and conversational OAuth links.
