@@ -28,6 +28,7 @@ from fastapi import Request
 from fastapi import Response
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk.auth import AuthConfig
@@ -317,17 +318,47 @@ async def chat(request: ChatRequest, response: Response):
   return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+_PENDING_CONSENTS: dict[str, str] = {}
+_LATEST_PENDING: dict[str, str] = {}
+
+
+@app.get("/start-auth")
+async def start_auth(user_id: str, consent_nonce: str, auth_uri: str):
+  """Bridge endpoint for Playground and conversational OAuth links.
+
+  Saves pending consent and sets cookies before redirecting to Spotify.
+  """
+  _PENDING_CONSENTS[user_id] = consent_nonce
+  _LATEST_PENDING["user_id"] = user_id
+  _LATEST_PENDING["consent_nonce"] = consent_nonce
+
+  response = RedirectResponse(url=auth_uri, status_code=302)
+  response.set_cookie(
+      key="consent_user_id", value=user_id, httponly=True, samesite="lax"
+  )
+  response.set_cookie(
+      key="consent_nonce", value=consent_nonce, httponly=True, samesite="lax"
+  )
+  return response
+
+
 @app.get("/validateUserId")
 @app.get("/commit")
 async def validate_user_id(request: Request):
-  # Session data stored in cookies
+  # Session data stored in cookies or fallback memory
   user_id = (
       request.query_params.get("user_id")
       or request.cookies.get("consent_user_id")
       or request.cookies.get("user_id")
+      or _LATEST_PENDING.get("user_id")
       or "default_user_id"
   )
-  consent_nonce = request.query_params.get("consent_nonce") or request.cookies.get("consent_nonce")
+  consent_nonce = (
+      request.query_params.get("consent_nonce")
+      or request.cookies.get("consent_nonce")
+      or _PENDING_CONSENTS.get(user_id)
+      or _LATEST_PENDING.get("consent_nonce")
+  )
   session_id = request.cookies.get("session_id")
   # Query params
   user_id_validation_state = request.query_params.get(
@@ -393,15 +424,33 @@ async def validate_user_id(request: Request):
     print(f"HTTP Response Body: {response.text}")
 
     if response.status_code == 200:
-      # Return a simple HTML page to indicate OAuth success
+      # Return a friendly HTML page to indicate OAuth success
       html_content = """
       <!DOCTYPE html>
       <html>
       <head>
-          <title>Authorization Successful</title>
+          <title>Spotify Authorization Successful</title>
+          <style>
+            body { font-family: Roboto, -apple-system, Arial, sans-serif; background: #f8f9fa; margin: 0; padding: 40px; display: flex; justify-content: center; align-items: center; min-height: 80vh; }
+            .card { background: white; max-width: 520px; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; }
+            .icon { font-size: 48px; margin-bottom: 16px; }
+            h2 { color: #1DB954; margin-top: 0; margin-bottom: 12px; font-size: 24px; }
+            p { color: #444; font-size: 16px; line-height: 1.6; margin: 10px 0; }
+            .badge { display: inline-block; background: #e8f5e9; color: #2e7d32; padding: 6px 14px; border-radius: 20px; font-weight: 500; font-size: 14px; margin-bottom: 20px; }
+            .hint { background: #f1f3f4; padding: 12px 16px; border-radius: 8px; font-size: 14px; color: #5f6368; margin-top: 24px; }
+          </style>
       </head>
       <body>
-          <p>Authorization successful! You can close this window.</p>
+          <div class="card">
+            <div class="icon">🎉</div>
+            <div class="badge">Connected to Spotify</div>
+            <h2>Authorization Successful!</h2>
+            <p>Your Spotify credentials have been finalized with Google Cloud Auth Manager.</p>
+            <p>You can close this tab and return to your <strong>Playground</strong> or chat interface.</p>
+            <div class="hint">
+              👉 Reply with <strong>"Done"</strong> or <strong>"Fetch my playlists"</strong> in the chat to see your private playlists!
+            </div>
+          </div>
       </body>
       </html>
       """

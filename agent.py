@@ -60,7 +60,7 @@ async def spotify_get_playlists(tool_context: ToolContext) -> str | list[dict[st
     user_id = tool_context.user_id or "default_user_id"
     client = iam_creds.IAMConnectorCredentialsServiceClient(transport="rest")
 
-    # Step A: Query Google Cloud Auth Manager for user credentials
+    # Step A: Query Google Cloud Auth Manager for user credentials (SINGLE CALL ONLY)
     req = iam_creds.RetrieveCredentialsRequest(
         connector=SPOTIFY_3LO_AUTH_PROVIDER,
         user_id=user_id,
@@ -75,37 +75,28 @@ async def spotify_get_playlists(tool_context: ToolContext) -> str | list[dict[st
         if resp.token:
             token = resp.token
 
-    # Step B: If token is not yet ready, generate an authorization URL for the user
+    # Step B: If token is not yet ready, generate the authorization link for the user
     if not token:
         if operation.metadata:
             meta = iam_creds.RetrieveCredentialsMetadata.deserialize(operation.metadata.value)
             if meta.uri_consent_required and meta.uri_consent_required.authorization_uri:
+                auth_uri = meta.uri_consent_required.authorization_uri
                 consent_nonce = meta.uri_consent_required.consent_nonce
-                # Embed user_id and consent_nonce in continue_uri so callback can finalize
-                callback_url = f"{CONTINUE_URI}?user_id={user_id}&consent_nonce={consent_nonce}"
-                req_with_callback = iam_creds.RetrieveCredentialsRequest(
-                    connector=SPOTIFY_3LO_AUTH_PROVIDER,
-                    user_id=user_id,
-                    scopes=["playlist-read-private"],
-                    continue_uri=callback_url,
-                )
-                op_with_callback = client.retrieve_credentials(req_with_callback).operation
-                meta_callback = (
-                    iam_creds.RetrieveCredentialsMetadata.deserialize(op_with_callback.metadata.value)
-                    if op_with_callback.metadata
-                    else None
-                )
 
-                auth_url = (
-                    meta_callback.uri_consent_required.authorization_uri
-                    if (meta_callback and meta_callback.uri_consent_required and meta_callback.uri_consent_required.authorization_uri)
-                    else meta.uri_consent_required.authorization_uri
+                # Base host from CONTINUE_URI (e.g., http://localhost:8080)
+                base_host = CONTINUE_URI.rsplit("/", 1)[0]
+                import urllib.parse
+                start_auth_url = (
+                    f"{base_host}/start-auth?"
+                    f"user_id={urllib.parse.quote(user_id)}&"
+                    f"consent_nonce={urllib.parse.quote(consent_nonce)}&"
+                    f"auth_uri={urllib.parse.quote(auth_uri)}"
                 )
 
                 return (
                     "🔒 **Spotify Authorization Required**\n\n"
                     "To access your private playlists, please authorize access to your Spotify account:\n\n"
-                    f"👉 [**Click here to Authorize Spotify Access**]({auth_url})\n\n"
+                    f"👉 [**Click here to Authorize Spotify Access**]({start_auth_url})\n\n"
                     "*(Once you click the link and complete authorization in your browser, "
                     "return to this chat and reply with **'Done'** or **'Fetch my playlists'**)*"
                 )
@@ -152,8 +143,8 @@ root_agent = Agent(
     instruction=(
         "You are a helpful Spotify assistant. When the user asks for their playlists, "
         "always use the spotify_get_playlists tool. If the tool returns an authorization "
-        "link, display it clearly as a clickable markdown link and prompt the user to "
-        "complete authorization. Once authorized, format the playlist details cleanly."
+        "link, display it clearly as a clickable markdown link without altering the URL and "
+        "prompt the user to complete authorization. Once authorized, format the playlist details cleanly."
     ),
     tools=[spotify_tool],
 )
