@@ -321,10 +321,13 @@ async def chat(request: ChatRequest, response: Response):
 @app.get("/commit")
 async def validate_user_id(request: Request):
   # Session data stored in cookies
-  user_id = request.cookies.get("consent_user_id") or request.cookies.get(
-      "user_id"
+  user_id = (
+      request.query_params.get("user_id")
+      or request.cookies.get("consent_user_id")
+      or request.cookies.get("user_id")
+      or "default_user_id"
   )
-  consent_nonce = request.cookies.get("consent_nonce")
+  consent_nonce = request.query_params.get("consent_nonce") or request.cookies.get("consent_nonce")
   session_id = request.cookies.get("session_id")
   # Query params
   user_id_validation_state = request.query_params.get(

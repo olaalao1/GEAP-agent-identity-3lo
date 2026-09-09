@@ -19,12 +19,9 @@ from typing import Any
 
 from google.adk.agents import Agent
 from google.adk.apps import App
-from google.adk.auth.auth_credential import AuthCredential
-from google.adk.auth.auth_tool import AuthConfig
-from google.adk.auth.credential_manager import CredentialManager
-from google.adk.integrations.agent_identity import GcpAuthProvider
-from google.adk.integrations.agent_identity import GcpAuthProviderScheme
-from google.adk.tools.authenticated_function_tool import AuthenticatedFunctionTool
+from google.adk.tools import FunctionTool
+from google.adk.tools import ToolContext
+from google.cloud import iamconnectorcredentials_v1alpha as iam_creds
 import httpx
 from vertexai import agent_engines
 
@@ -44,7 +41,6 @@ SPOTIFY_3LO_AUTH_PROVIDER = (
 )
 
 # 2. Frontend Return URL (continue_uri)
-# Where user is redirected after Spotify authorization to finalize credentials
 CONTINUE_URI = os.environ.get(
     "CONTINUE_URI", "http://localhost:8080/commit"
 )
@@ -53,22 +49,73 @@ MODEL = "gemini-2.5-flash"
 
 
 # ==============================================================================
-# 3. Authenticated Tool Function
+# 3. Spotify Authenticated Tool Function (with Conversational OAuth Link)
 # ==============================================================================
-async def spotify_get_playlists(credential: AuthCredential) -> str | list[dict[str, Any]]:
-    """Fetches the current user's private playlists from Spotify."""
-    headers = {}
-    if http := credential.http:
-        if http.scheme and http.credentials and (token := http.credentials.token):
-            headers["Authorization"] = f"{http.scheme.title()} {token}"
-        if http.additional_headers:
-            headers.update(http.additional_headers)
+async def spotify_get_playlists(tool_context: ToolContext) -> str | list[dict[str, Any]]:
+    """Fetches the current user's private playlists from Spotify.
 
-    if not headers:
-        return "Error: No authentication token available."
+    If the user has not yet authorized Spotify access, this tool automatically
+    returns a clickable Spotify authorization link directly in the chat.
+    """
+    user_id = tool_context.user_id or "default_user_id"
+    client = iam_creds.IAMConnectorCredentialsServiceClient(transport="rest")
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
+    # Step A: Query Google Cloud Auth Manager for user credentials
+    req = iam_creds.RetrieveCredentialsRequest(
+        connector=SPOTIFY_3LO_AUTH_PROVIDER,
+        user_id=user_id,
+        scopes=["playlist-read-private"],
+        continue_uri=CONTINUE_URI,
+    )
+    operation = client.retrieve_credentials(req).operation
+
+    token = None
+    if operation.done and operation.response:
+        resp = iam_creds.RetrieveCredentialsResponse.deserialize(operation.response.value)
+        if resp.token:
+            token = resp.token
+
+    # Step B: If token is not yet ready, generate an authorization URL for the user
+    if not token:
+        if operation.metadata:
+            meta = iam_creds.RetrieveCredentialsMetadata.deserialize(operation.metadata.value)
+            if meta.uri_consent_required and meta.uri_consent_required.authorization_uri:
+                consent_nonce = meta.uri_consent_required.consent_nonce
+                # Embed user_id and consent_nonce in continue_uri so callback can finalize
+                callback_url = f"{CONTINUE_URI}?user_id={user_id}&consent_nonce={consent_nonce}"
+                req_with_callback = iam_creds.RetrieveCredentialsRequest(
+                    connector=SPOTIFY_3LO_AUTH_PROVIDER,
+                    user_id=user_id,
+                    scopes=["playlist-read-private"],
+                    continue_uri=callback_url,
+                )
+                op_with_callback = client.retrieve_credentials(req_with_callback).operation
+                meta_callback = (
+                    iam_creds.RetrieveCredentialsMetadata.deserialize(op_with_callback.metadata.value)
+                    if op_with_callback.metadata
+                    else None
+                )
+
+                auth_url = (
+                    meta_callback.uri_consent_required.authorization_uri
+                    if (meta_callback and meta_callback.uri_consent_required and meta_callback.uri_consent_required.authorization_uri)
+                    else meta.uri_consent_required.authorization_uri
+                )
+
+                return (
+                    "🔒 **Spotify Authorization Required**\n\n"
+                    "To access your private playlists, please authorize access to your Spotify account:\n\n"
+                    f"👉 [**Click here to Authorize Spotify Access**]({auth_url})\n\n"
+                    "*(Once you click the link and complete authorization in your browser, "
+                    "return to this chat and reply with **'Done'** or **'Fetch my playlists'**)*"
+                )
+
+        return "Error: Unable to retrieve credentials or generate authorization URL from Auth Manager."
+
+    # Step C: When token is available, query Spotify Web API
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.get(
             "https://api.spotify.com/v1/me/playlists",
             headers=headers,
             params={"limit": 10},
@@ -81,7 +128,7 @@ async def spotify_get_playlists(credential: AuthCredential) -> str | list[dict[s
         items = data.get("items", [])
 
         if not items:
-            return "No playlists found for the current user."
+            return "No playlists found for the current user on Spotify."
 
         return [
             {
@@ -95,37 +142,20 @@ async def spotify_get_playlists(credential: AuthCredential) -> str | list[dict[s
 
 
 # ==============================================================================
-# 4. Auth Provider Scheme & Tool Registration
+# 4. Agent & App Definitions
 # ==============================================================================
-# Register GCP Agent Identity provider with CredentialManager
-CredentialManager.register_auth_provider(GcpAuthProvider())
+spotify_tool = FunctionTool(func=spotify_get_playlists)
 
-spotify_auth_config_3lo = AuthConfig(
-    auth_scheme=GcpAuthProviderScheme(
-        name=SPOTIFY_3LO_AUTH_PROVIDER,
-        scopes=["playlist-read-private"],
-        continue_uri=CONTINUE_URI,
-    )
-)
-
-spotify_get_playlist_tool = AuthenticatedFunctionTool(
-    func=spotify_get_playlists,
-    auth_config=spotify_auth_config_3lo,
-)
-
-
-# ==============================================================================
-# 5. Agent & App Definitions
-# ==============================================================================
 root_agent = Agent(
     name="spotify_3lo_agent",
     model=MODEL,
     instruction=(
-        "You are a helpful Spotify assistant. Use your tools to fetch "
-        "the user's private playlists when requested. Keep responses concise, "
-        "friendly, and well-structured."
+        "You are a helpful Spotify assistant. When the user asks for their playlists, "
+        "always use the spotify_get_playlists tool. If the tool returns an authorization "
+        "link, display it clearly as a clickable markdown link and prompt the user to "
+        "complete authorization. Once authorized, format the playlist details cleanly."
     ),
-    tools=[spotify_get_playlist_tool],
+    tools=[spotify_tool],
 )
 
 app = App(
