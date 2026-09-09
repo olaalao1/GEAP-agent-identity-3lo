@@ -30,7 +30,7 @@ from vertexai import agent_engines
 # ==============================================================================
 # Configuration & Resource Identifiers
 # ==============================================================================
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "gemini-cyber")
+PROJECT_ID = "gemini-cyber"
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 SPOTIFY_3LO_AUTH_PROVIDER_ID = os.environ.get(
     "SPOTIFY_3LO_AUTH_PROVIDER_ID", "spotify-3lo-auth"
@@ -56,12 +56,12 @@ _PENDING_NONCES: dict[str, str] = {}
 
 def extract_validation_state(input_str: str) -> str:
     """Extracts the user_id_validation_state from a raw token or full callback URL."""
-    s = input_str.strip()
+    s = input_str.strip().strip('"\'`')
     if "user_id_validation_state=" in s:
-        match = re.search(r"user_id_validation_state=([A-Za-z0-9_\-]+)", s)
+        match = re.search(r"user_id_validation_state=([A-Za-z0-9_\-=]+)", s)
         if match:
             return match.group(1)
-    tokens = re.findall(r"[A-Za-z0-9_\-]{40,}", s)
+    tokens = re.findall(r"[A-Za-z0-9_\-=]{40,}", s)
     if tokens:
         return tokens[0]
     return s
@@ -131,6 +131,9 @@ async def spotify_get_playlists(
                 "consentNonce": consent_nonce,
             }
 
+            print(f"DEBUG FINALIZING: url={finalize_url}", flush=True)
+            print(f"DEBUG FINALIZING: userId={user_id}, consentNonce={consent_nonce}, val_state_len={len(val_state)}", flush=True)
+
             async with httpx.AsyncClient() as http_client:
                 fin_resp = await http_client.post(
                     finalize_url,
@@ -138,10 +141,16 @@ async def spotify_get_playlists(
                     headers={"Content-Type": "application/json"},
                 )
 
+            print(f"DEBUG FINALIZE STATUS: {fin_resp.status_code}", flush=True)
+            print(f"DEBUG FINALIZE BODY: {fin_resp.text}", flush=True)
+
             if fin_resp.status_code != 200:
                 return (
-                    f"Authorization finalization failed (HTTP {fin_resp.status_code}): {fin_resp.text}\n\n"
-                    "Please ask for your playlists again to receive a fresh authorization link."
+                    f"❌ **Spotify Credential Finalization Failed (HTTP {fin_resp.status_code})**\n\n"
+                    f"**Details from Google Cloud Auth Manager:**\n"
+                    f"```json\n{fin_resp.text}\n```\n\n"
+                    f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`\n\n"
+                    "Please check the error details above or ask for your playlists again to receive a fresh authorization link."
                 )
 
             # Step C: Credentials successfully finalized! Retrieve the new access token
@@ -227,7 +236,9 @@ root_agent = Agent(
         "3. When the user provides an authorization code, token, or callback URL in their response, "
         "immediately call spotify_get_playlists with the auth_code_or_url parameter containing "
         "the user's provided code or URL.\n"
-        "4. Once the playlists are retrieved, present the playlist names and track counts clearly."
+        "4. If the tool returns an error message or failure details, display the EXACT error text "
+        "returned by the tool verbatim without summarizing or omitting details.\n"
+        "5. Once the playlists are retrieved, present the playlist names and track counts clearly."
     ),
     tools=[spotify_tool],
 )
