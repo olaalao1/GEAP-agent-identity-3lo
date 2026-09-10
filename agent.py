@@ -117,8 +117,8 @@ async def spotify_get_playlists(
 
     val_state = await extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
 
-    print(f"DEBUG INPUT auth_code_or_url: {repr(auth_code_or_url)[:100]}", flush=True)
-    print(f"DEBUG EXTRACTED val_state: {repr(val_state)[:100]}", flush=True)
+    print(f"DEBUG INPUT auth_code_or_url: {repr(auth_code_or_url)}", flush=True)
+    print(f"DEBUG EXTRACTED val_state: {repr(val_state)}", flush=True)
     print(f"DEBUG val_state len: {len(val_state)}", flush=True)
 
     # If the user pasted the Spotify login link instead of the code:
@@ -188,11 +188,19 @@ async def spotify_get_playlists(
                 break
 
         if not fin_resp or fin_resp.status_code != 200:
+            err_text = fin_resp.text if fin_resp else "No response"
+            hint = ""
+            if "Failed to decode and decrypt the user_id_validation_state" in err_text:
+                hint = (
+                    "\n\n💡 **Tip:** This error occurs when the copied authorization code "
+                    "does not match this specific chat turn's session (e.g. copied from an older tab or previous link). "
+                    "Please close any open `oauth_callback` tabs, ask for your playlists again, and click the fresh link generated in this chat."
+                )
             return (
                 f"❌ **Spotify Credential Finalization Failed (HTTP {fin_resp.status_code if fin_resp else 'Unknown'})**\n\n"
                 f"**Details from Google Cloud Auth Manager:**\n"
-                f"```json\n{fin_resp.text if fin_resp else 'No response'}\n```\n\n"
-                f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`, `tokenLen`: `{len(val_state)}`\n\n"
+                f"```json\n{err_text}\n```\n\n"
+                f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`, `tokenLen`: `{len(val_state)}`{hint}\n\n"
                 "Please check the error details above or ask for your playlists again to receive a fresh authorization link."
             )
 
@@ -251,7 +259,7 @@ async def spotify_get_playlists(
                     try:
                         tool_context.state["user_id"] = user_id
                         tool_context.state["consent_nonce"] = consent_nonce
-                        print(f"DEBUG SAVED STATE: user_id={user_id}, consent_nonce={consent_nonce}", flush=True)
+                        print(f"DEBUG SAVED STATE: user_id={user_id}, consent_nonce={consent_nonce}, auth_uri={auth_uri}", flush=True)
                     except Exception as e:
                         print(f"Warning saving tool_context.state: {e}", flush=True)
 
