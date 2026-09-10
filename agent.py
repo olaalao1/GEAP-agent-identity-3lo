@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+import urllib.parse
 
 from google.adk.agents import Agent
 from google.adk.apps import App
@@ -54,22 +54,48 @@ MODEL = "gemini-2.5-flash"
 _PENDING_NONCES: dict[str, str] = {}
 
 
-def extract_validation_state(input_str: str) -> str:
-    """Extracts the user_id_validation_state from a raw token or full callback URL."""
+async def extract_validation_state(input_str: str) -> str:
+    """Extracts the user_id_validation_state from a raw token, callback URL, or redirect."""
     s = input_str.strip().strip('"\'`')
+
+    # Case 1: User pasted the Spotify authorization link by mistake
+    if "accounts.spotify.com/authorize" in s:
+        return "ERROR_SPOTIFY_AUTH_URL"
+
+    # Case 2: User pasted the Auth Manager callback URL directly
+    if "iamconnectorcredentials.googleapis.com" in s and "oauthcallback" in s:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(s, follow_redirects=False)
+                loc = r.headers.get("location")
+                if loc and "user_id_validation_state=" in loc:
+                    m = re.search(r"user_id_validation_state=([^&\s]+)", loc)
+                    if m:
+                        s = m.group(1)
+        except Exception as e:
+            print(f"Warning following callback URL: {e}", flush=True)
+
+    # Case 3: User pasted full GCS landing page URL
     if "user_id_validation_state=" in s:
-        match = re.search(r"user_id_validation_state=([A-Za-z0-9_\-=]+)", s)
-        if match:
-            s = match.group(1)
-    else:
-        tokens = re.findall(r"[A-Za-z0-9_\-=]{40,}", s)
-        if tokens:
-            s = tokens[0]
+        m = re.search(r"user_id_validation_state=([^&\s]+)", s)
+        if m:
+            s = m.group(1)
+
+    # Case 4: Strip all internal whitespace / line breaks from copying
+    s = "".join(s.split())
+
+    # Case 5: Strip quotes or key: value prefixes
+    if ":" in s:
+        s = s.split(":")[-1]
+
+    # Decode URL-encoding if present
+    s = urllib.parse.unquote(s)
 
     # Ensure required base64 padding
     missing_padding = len(s) % 4
     if missing_padding:
         s += "=" * (4 - missing_padding)
+
     return s
 
 
@@ -89,7 +115,24 @@ async def spotify_get_playlists(
     user_id = tool_context.user_id or "default_user_id"
     client = iam_creds.IAMConnectorCredentialsServiceClient(transport="rest")
 
-    val_state = extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
+    val_state = await extract_validation_state(auth_code_or_url) if auth_code_or_url else ""
+
+    print(f"DEBUG INPUT auth_code_or_url: {repr(auth_code_or_url)[:100]}", flush=True)
+    print(f"DEBUG EXTRACTED val_state: {repr(val_state)[:100]}", flush=True)
+    print(f"DEBUG val_state len: {len(val_state)}", flush=True)
+
+    # If the user pasted the Spotify login link instead of the code:
+    if val_state == "ERROR_SPOTIFY_AUTH_URL":
+        return (
+            "⚠️ **Spotify Login Link Detected**\n\n"
+            "You pasted the Spotify login link (`accounts.spotify.com/authorize...`) instead of the authorization code.\n\n"
+            "**Next Step:**\n"
+            "1. Click that link in your browser to log into Spotify and approve access.\n"
+            "2. You will be redirected to the green confirmation page (`oauth_callback.html`).\n"
+            "3. Click **\"📋 Copy Authorization Code\"** on that page.\n"
+            "4. **Paste that code back into this chat**."
+        )
+
     is_code_provided = bool(val_state and len(val_state) >= 20)
 
     # Step B: If the user provided an authorization code -> Finalize credentials!
@@ -127,6 +170,7 @@ async def spotify_get_playlists(
         endpoints = [
             f"https://iamconnectorcredentials.googleapis.com/v1alpha/{SPOTIFY_3LO_AUTH_PROVIDER}/credentials:finalize",
             f"https://iamconnectorcredentials.googleapis.com/v1alpha/projects/gemini-cyber/locations/{LOCATION}/connectors/{SPOTIFY_3LO_AUTH_PROVIDER_ID}/credentials:finalize",
+            f"https://iamconnectorcredentials.googleapis.com/v1alpha/projects/1092333466205/locations/{LOCATION}/connectors/{SPOTIFY_3LO_AUTH_PROVIDER_ID}/credentials:finalize",
         ]
 
         fin_resp = None
@@ -148,7 +192,7 @@ async def spotify_get_playlists(
                 f"❌ **Spotify Credential Finalization Failed (HTTP {fin_resp.status_code if fin_resp else 'Unknown'})**\n\n"
                 f"**Details from Google Cloud Auth Manager:**\n"
                 f"```json\n{fin_resp.text if fin_resp else 'No response'}\n```\n\n"
-                f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`\n\n"
+                f"*Debug parameters used:* `userId`: `{user_id}`, `consentNonce`: `{consent_nonce}`, `tokenLen`: `{len(val_state)}`\n\n"
                 "Please check the error details above or ask for your playlists again to receive a fresh authorization link."
             )
 
